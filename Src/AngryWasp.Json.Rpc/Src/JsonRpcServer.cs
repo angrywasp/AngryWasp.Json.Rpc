@@ -5,7 +5,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Security;
 using System.Reflection;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
 using Log = AngryWasp.Logger.Log;
@@ -18,16 +21,21 @@ namespace AngryWasp.Json.Rpc
         HttpListener listener;
 
         private ushort port = 0;
+        private string sslCertPath = null;
+        private X509Certificate2 certificate;
 
         public ushort Port => port;
+
+        public string SslCertPath => sslCertPath;
 
         public delegate Task<JsonRpcServerCommandResult> RpcFunc(string args);
 
         private Dictionary<string, RpcFunc> commands = new Dictionary<string, RpcFunc>();
 
-        public JsonRpcServer(ushort port)
+        public JsonRpcServer(ushort port, string sslCertPath = null)
         {
             this.port = port;
+            this.sslCertPath = sslCertPath;
         }
 
         public void RegisterCommand(string key, RpcFunc value)
@@ -57,11 +65,22 @@ namespace AngryWasp.Json.Rpc
 
         public void Start()
         {
-
             listener = new HttpListener();
-            //todo: SSL and authentication
-            listener.Prefixes.Add($"http://*:{port}/");
-            listener.AuthenticationSchemes = AuthenticationSchemes.Anonymous;
+            if (sslCertPath == null)
+            {
+                listener.Prefixes.Add($"http://*:{port}/");
+                listener.AuthenticationSchemes = AuthenticationSchemes.Anonymous;
+            }
+            else if (File.Exists(sslCertPath))
+            {
+                Log.Instance.WriteInfo($"Initializing RPC Server with SSL");
+
+                certificate = new X509Certificate2(X509Certificate2.CreateFromCertFile(sslCertPath));
+                listener.Prefixes.Add($"https://*:{port}/");
+                listener.AuthenticationSchemes = AuthenticationSchemes.Anonymous;
+            }
+            else
+                throw new Exception("SSL Certificate not found");
 
             try
             {
@@ -78,12 +97,21 @@ namespace AngryWasp.Json.Rpc
 
             Task.Run(async () =>
             {
-                while (true)
-                {
-                    HttpListenerContext context = listener.GetContext();
-                    Log.Instance.WriteInfo($"Request from {context.Request.LocalEndPoint.Address}");
-                    await HandleRequest(context).ConfigureAwait(false);
-                }
+                if (certificate == null)
+                    while (true)
+                    {
+                        HttpListenerContext context = listener.GetContext();
+                        Log.Instance.WriteInfo($"Request from {context.Request.LocalEndPoint.Address}");
+                        await HandleRequest(context).ConfigureAwait(false);
+                    }
+                else
+                    while (true)
+                    {
+                        HttpListenerContext context = listener.GetContext();
+                        Log.Instance.WriteInfo($"SSL Request from {context.Request.LocalEndPoint.Address}");
+                        await HandleSslRequest(context).ConfigureAwait(false);
+                    }
+
             });
         }
 
@@ -94,13 +122,58 @@ namespace AngryWasp.Json.Rpc
 
             if (request.Url.Segments.Length < 2)
             {
-                Log.Instance.WriteWarning("Received a request without an endpoint");
+                response.StatusCode = 400;
                 context.Response.Close();
+                return;
+            }
+
+            await GenerateResponse(context).ConfigureAwait(false);
+        }
+
+        private async Task HandleSslRequest(HttpListenerContext context)
+        {
+            HttpListenerRequest request = context.Request;
+            HttpListenerResponse response = context.Response;
+
+            if (request.Url.Segments.Length < 2)
+            {
+                response.StatusCode = 400;
+                response.Close();
+                return;
+            }
+
+            var clientCertificate = request.GetClientCertificate();
+            if (clientCertificate == null || !clientCertificate.Verify())
+            {
+                response.StatusCode = 403;
+                response.Close();
+                return;
+            }
+
+            // Perform SSL/TLS negotiation manually
+            var sslStream = new SslStream(response.OutputStream, false);
+            try
+            {
+                await sslStream.AuthenticateAsServerAsync(certificate, false, SslProtocols.Tls12, true);
+            }
+            catch (AuthenticationException ex)
+            {
+                Log.Instance.WriteException(ex, "SSL/TLS handshake failed");
+                response.StatusCode = 500;
+                response.Close();
                 return;
             }
 
             response.ContentType = "application/json";
             response.AppendHeader("Access-Control-Allow-Origin", "*");
+
+            await GenerateResponse(context).ConfigureAwait(false);
+        }
+
+        private async Task GenerateResponse(HttpListenerContext context)
+        {
+            HttpListenerRequest request = context.Request;
+            HttpListenerResponse response = context.Response;
 
             string text;
             using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
